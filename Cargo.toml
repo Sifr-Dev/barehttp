@@ -1,0 +1,6 @@
+[package]
+name = "sifr-serve"
+version = "0.1.0"
+edition = "2021"
+description = "Zero-dependency static file HTTP/1.1 server — correct statuses, MIME types, traversal-safe, conditional requests"
+license = "MIT"
