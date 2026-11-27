@@ -17,7 +17,9 @@ sifr-serve /var/www --port 8090
 
 ## features
 
-- GET/HEAD with correct 200/400/403/404/405
+- GET/HEAD with correct 200/400/403/404/405/413/431
+- bounded incremental request-head parsing across fragmented TCP reads
+- strict `Content-Length` / `Transfer-Encoding` framing validation
 - `index.html` for directory requests
 - MIME by extension (html/css/js/json/md/png/pdf/wasm/wav/flac/…)
 - path traversal protection (canonicalized root, `/../../etc/passwd` → 403)
@@ -39,17 +41,20 @@ $ curl -s -o /dev/null -w '%{http_code}' -X POST localhost:8899/   → 405
 ## tests
 
 ```sh
-cargo test            # 28 deterministic tests, ~0.0 s
+cargo test            # 37 deterministic tests
 cargo test --release
 ```
 
-The suite is offline and needs no fixtures: request parsing (versions,
-malformed input, header scanning), HTTP date formatting and the
-days-from-civil conversion, the MIME table, percent decoding, response
-framing (including HEAD body suppression and Content-Length), path
-resolution (`index.html`, query strings, traversal and prefix-sibling
-rejection), plus two bounded end-to-end exchanges against the real handler on
-a loopback socket bound to port 0.
+The suite is offline and creates its own temporary fixtures: request parsing
+(versions, malformed input, header scanning), HTTP date formatting and the
+days-from-civil conversion, the MIME table, percent decoding, response framing
+(including HEAD body suppression and Content-Length), and path resolution
+(`index.html`, query strings, traversal and prefix-sibling rejection). Real
+loopback tests exercise complete heads written one byte per TCP write, coalesced
+input, malformed or conflicting body framing, incomplete EOF, and the 16 KiB
+head limit. Each exchange uses the real handler and an ephemeral port; no test
+server is left running. The server intentionally closes after one response and
+does not support persistent HTTP pipelining.
 
 ## license
 

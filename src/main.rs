@@ -177,6 +177,7 @@ fn parse_request_checked(raw: &[u8]) -> Result<Request, RequestError> {
     }
     let mut if_mod = None;
     let mut content_length: Option<u64> = None;
+    let mut saw_transfer_encoding = false;
     for line in lines {
         if line.is_empty() {
             break;
@@ -189,18 +190,28 @@ fn parse_request_checked(raw: &[u8]) -> Result<Request, RequestError> {
         if name.eq_ignore_ascii_case("if-modified-since") {
             if_mod = Some(value.to_string());
         } else if name.eq_ignore_ascii_case("content-length") {
-            // A Content-Length is an unsigned decimal byte count. A non-numeric
-            // value, an empty value, or two different values leave the message
-            // length ambiguous, so the request is malformed.
-            let parsed: u64 = value.parse().map_err(|_| RequestError::Malformed)?;
-            match content_length {
-                Some(previous) if previous != parsed => return Err(RequestError::Malformed),
-                _ => content_length = Some(parsed),
+            // Content-Length is a nonempty sequence of decimal digits. Reject
+            // every repeated field, even when its values agree: accepting only
+            // selected duplicates makes this parser's framing differ from
+            // stricter peers. Transfer-Encoding and Content-Length together
+            // are always ambiguous, regardless of their order.
+            if saw_transfer_encoding || content_length.is_some() || value.is_empty()
+                || !value.bytes().all(|b| b.is_ascii_digit())
+            {
+                return Err(RequestError::Malformed);
             }
-        } else if name.eq_ignore_ascii_case("transfer-encoding") && !value.eq_ignore_ascii_case("identity") {
-            // Body framing is never read, so an unsupported coding cannot be
-            // decoded. Refuse it instead of answering as though no body existed.
-            return Err(RequestError::UnsupportedTransferEncoding);
+            content_length = Some(value.parse().map_err(|_| RequestError::Malformed)?);
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            // Multiple transfer-coding fields, or a coding combined with
+            // Content-Length, are refused. Identity is the only coding this
+            // server can accept without reading and decoding a body.
+            if saw_transfer_encoding || content_length.is_some() {
+                return Err(RequestError::Malformed);
+            }
+            saw_transfer_encoding = true;
+            if !value.eq_ignore_ascii_case("identity") {
+                return Err(RequestError::UnsupportedTransferEncoding);
+            }
         }
     }
     Ok(Request { method, path: raw_path, if_modified_since: if_mod, content_length })
@@ -365,14 +376,12 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() + 1 && i + 2 <= bytes.len() - 1 + 1 {
-            if i + 2 < bytes.len() + 1 && i + 2 <= bytes.len() - 1 {
-                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
-                if let Ok(v) = u8::from_str_radix(hex, 16) {
-                    out.push(v);
-                    i += 3;
-                    continue;
-                }
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+            if let Ok(v) = u8::from_str_radix(hex, 16) {
+                out.push(v);
+                i += 3;
+                continue;
             }
         }
         out.push(bytes[i]);
@@ -405,11 +414,9 @@ fn main() {
         std::process::exit(1);
     });
     println!("sifr-serve root={} url=http://127.0.0.1:{port}/", root_path.display());
-    for stream in listener.incoming() {
-        if let Ok(s) = stream {
-            let root = root_path.clone();
-            std::thread::spawn(move || handle(s, &root));
-        }
+    for stream in listener.incoming().flatten() {
+        let root = root_path.clone();
+        std::thread::spawn(move || handle(stream, &root));
     }
 }
 
@@ -843,5 +850,246 @@ mod verification {
             "conditional request did not return 304: {second}"
         );
         fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod loopback_framing {
+    //! Request-framing regressions over real TCP sockets. These tests use the
+    //! production handler directly, with a fresh ephemeral listener per case.
+
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    // Keep this protocol-level expectation independent so the same module can
+    // also be run against the pre-incremental-reader implementation.
+    const HEAD_LIMIT: usize = 16 * 1024;
+
+    fn test_root(tag: &str) -> PathBuf {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "sifr-serve-framing-{}-{tag}-{unique}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a.txt"), b"framing test body").unwrap();
+        dir
+    }
+
+    /// Run one client exchange and return every response byte through EOF.
+    fn exchange<F>(root: &Path, send_request: F) -> Vec<u8>
+    where
+        F: FnOnce(&mut TcpStream) + Send + 'static,
+    {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let root = root.to_path_buf();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle(stream, &root);
+        });
+
+        let mut client = TcpStream::connect(address).unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        client.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        send_request(&mut client);
+        let mut response = Vec::new();
+        loop {
+            let mut chunk = [0u8; 4096];
+            match client.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => response.extend_from_slice(&chunk[..n]),
+                // The handler closes as soon as an oversized head is rejected.
+                // If excess request bytes are still queued, Linux reports that
+                // close as a reset; response bytes read before it remain valid.
+                Err(e) if e.kind() == io::ErrorKind::ConnectionReset && !response.is_empty() => break,
+                Err(e) => panic!("reading loopback response failed: {e}"),
+            }
+        }
+        server.join().unwrap();
+        response
+    }
+
+    fn request(headers: &str) -> String {
+        format!("GET /a.txt HTTP/1.1\r\nHost: loopback\r\n{headers}\r\n")
+    }
+
+    fn one_request(root: &Path, raw: String) -> Vec<u8> {
+        exchange(root, move |client| {
+            // A peer may already have closed its write side after sending an
+            // over-limit stream, so an EPIPE here must not hide its response.
+            let _ = client.write_all(raw.as_bytes());
+            let _ = client.shutdown(std::net::Shutdown::Write);
+        })
+    }
+
+    fn status_line(response: &[u8]) -> String {
+        std::str::from_utf8(response)
+            .unwrap()
+            .split("\r\n")
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
+    fn assert_status(response: &[u8], expected: &str) {
+        assert_eq!(status_line(response), expected, "response: {}", String::from_utf8_lossy(response));
+    }
+
+    #[test]
+    fn headers_and_delimiters_fragmented_across_many_writes_are_served() {
+        let root = test_root("fragmented");
+        let canonical_root = root.canonicalize().unwrap();
+        let raw = request("X-First: one\r\nX-Second: two\r\nX-Third: three\r\n");
+        let write_count = raw.len();
+        let response = exchange(&canonical_root, move |client| {
+            client.set_nodelay(true).unwrap();
+            // One byte per write deliberately splits every CRLF, including the
+            // four-byte head terminator, rather than relying on read chunking.
+            for &byte in raw.as_bytes() {
+                if client.write_all(&[byte]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let _ = client.shutdown(std::net::Shutdown::Write);
+        });
+        assert!(write_count > 80, "test did not exercise many writes");
+        assert_status(&response, "HTTP/1.1 200 OK");
+        assert!(response.ends_with(b"framing test body"));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn coalesced_requests_only_serve_the_first_complete_head() {
+        let root = test_root("coalesced");
+        let canonical_root = root.canonicalize().unwrap();
+        let mut raw = request("");
+        raw.push_str("GET /a.txt HTTP/1.1\r\nHost: second\r\nIf-Modified-Since: invalid\r\n\r\n");
+        let response = one_request(&canonical_root, raw);
+        let text = String::from_utf8(response).unwrap();
+        assert_status(text.as_bytes(), "HTTP/1.1 200 OK");
+        assert_eq!(text.matches("HTTP/1.1 ").count(), 1, "{text}");
+        assert_eq!(text.matches("framing test body").count(), 1, "{text}");
+        assert!(text.contains("Connection: close\r\n"));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn malformed_content_length_is_rejected() {
+        let root = test_root("bad-length");
+        let canonical_root = root.canonicalize().unwrap();
+        for value in ["", "abc", "1, 1", "+1", "-1", "18446744073709551616"] {
+            let response = one_request(
+                &canonical_root,
+                request(&format!("Content-Length: {value}\r\n")),
+            );
+            assert_status(&response, "HTTP/1.1 400 Bad Request");
+        }
+        // A single decimal declaration retains the existing accepted behavior.
+        let response = one_request(&canonical_root, request("Content-Length: 0\r\n"));
+        assert_status(&response, "HTTP/1.1 200 OK");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn duplicate_or_conflicting_content_lengths_are_rejected() {
+        let root = test_root("duplicate-length");
+        let canonical_root = root.canonicalize().unwrap();
+        for headers in [
+            "Content-Length: 0\r\nContent-Length: 1\r\n",
+            "Content-Length: 0\r\nContent-Length: 0\r\n",
+            "Content-Length: 01\r\nContent-Length: 1\r\n",
+        ] {
+            let response = one_request(&canonical_root, request(headers));
+            assert_status(&response, "HTTP/1.1 400 Bad Request");
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn transfer_encoding_conflicts_and_duplicates_are_rejected() {
+        let root = test_root("transfer-encoding");
+        let canonical_root = root.canonicalize().unwrap();
+        for headers in [
+            "Transfer-Encoding: chunked\r\n",
+            "Transfer-Encoding: gzip\r\n",
+            "Transfer-Encoding: identity\r\nTransfer-Encoding: identity\r\n",
+            "Transfer-Encoding: chunked\r\nContent-Length: 4\r\n",
+            "Content-Length: 4\r\nTransfer-Encoding: chunked\r\n",
+            "Transfer-Encoding: identity\r\nContent-Length: 0\r\n",
+            "Content-Length: 0\r\nTransfer-Encoding: identity\r\n",
+        ] {
+            let response = one_request(&canonical_root, request(headers));
+            assert_status(&response, "HTTP/1.1 400 Bad Request");
+        }
+        let response = one_request(&canonical_root, request("Transfer-Encoding: identity\r\n"));
+        assert_status(&response, "HTTP/1.1 200 OK");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn eof_before_the_complete_delimiter_is_rejected() {
+        let root = test_root("incomplete-eof");
+        let canonical_root = root.canonicalize().unwrap();
+        for raw in [
+            "GET /a.txt HTTP/1.1\r\nHost: loopback\r\nX-Incomplete: yes\r\n",
+            "GET /a.txt HTTP/1.1\r\nHost: loopback\r\n\r",
+        ] {
+            let response = one_request(&canonical_root, raw.to_string());
+            assert_status(&response, "HTTP/1.1 400 Bad Request");
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn over_limit_socket_head_returns_431() {
+        let root = test_root("large-head");
+        let canonical_root = root.canonicalize().unwrap();
+        let mut raw = b"GET /a.txt HTTP/1.1\r\nHost: loopback\r\nX-Fill: ".to_vec();
+        raw.resize(HEAD_LIMIT + 4096, b'x');
+        let response = one_request(&canonical_root, raw.into_iter().map(char::from).collect());
+        assert_status(&response, "HTTP/1.1 431 Request Header Fields Too Large");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn declared_body_over_the_existing_limit_returns_413() {
+        let root = test_root("large-body");
+        let canonical_root = root.canonicalize().unwrap();
+        let response = one_request(
+            &canonical_root,
+            request("Content-Length: 65537\r\n"),
+        );
+        assert_status(&response, "HTTP/1.1 413 Payload Too Large");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn unterminated_reader_input_stops_at_the_buffer_limit() {
+        #[derive(Default)]
+        struct Endless {
+            bytes_read: usize,
+            calls: usize,
+        }
+
+        impl Read for Endless {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                assert!(!buf.is_empty());
+                self.calls += 1;
+                self.bytes_read += buf.len();
+                buf.fill(b'x');
+                Ok(buf.len())
+            }
+        }
+
+        let mut reader = Endless::default();
+        assert_eq!(read_request_head(&mut reader), HeadRead::TooLarge);
+        assert_eq!(reader.bytes_read, MAX_HEAD_BYTES);
+        assert_eq!(reader.calls, MAX_HEAD_BYTES / READ_CHUNK);
+        assert_eq!(HEAD_LIMIT, MAX_HEAD_BYTES);
     }
 }
