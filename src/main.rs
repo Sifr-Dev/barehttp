@@ -2,12 +2,34 @@
 //!   sifr-serve [root] [--port N]   (default: cwd, port 8080)
 //! Features: GET/HEAD, directory index.html, MIME by extension, path
 //! traversal protection (canonicalized root), Last-Modified + If-Modified-Since
-//! → 304, correct 400/403/404/405. No crates, no async — thread per connection.
+//! → 304, correct 400/403/404/405/413/431. Request heads are read
+//! incrementally up to their CRLFCRLF terminator, so a head split across TCP
+//! segments is parsed whole instead of being answered from one partial read.
+//! No crates, no async — thread per connection.
 use std::fs;
 use std::io::{Read, Write};
 use std::io;
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+/// Hard limit on the request head — request line, header fields and the
+/// terminating CRLFCRLF. Reading stops at the terminator, so body bytes are
+/// never treated as headers, and a peer that never terminates its head is cut
+/// off here instead of growing the buffer without bound.
+const MAX_HEAD_BYTES: usize = 16 * 1024;
+
+/// Largest declared request body the server will acknowledge. Bodies are never
+/// read (the response is sent and the connection closed), so this only bounds
+/// which framing declarations are accepted before answering 413.
+const MAX_BODY_BYTES: u64 = 64 * 1024;
+
+/// Bytes requested from the socket per read.
+const READ_CHUNK: usize = 4096;
+
+/// How long one read may block while the head is still incomplete. Bounds the
+/// time a stalled client can pin a worker thread; the byte limit bounds memory.
+const HEAD_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn mime_type(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()).unwrap_or("") {
@@ -63,31 +85,139 @@ struct Request {
     method: String,
     path: String,
     if_modified_since: Option<String>,
+    /// Value of the `Content-Length` header, when the request declared one. The
+    /// server never reads request bodies (it answers and closes), but an
+    /// unparsable, contradictory or oversized declaration is still a framing
+    /// error and must be refused rather than ignored.
+    content_length: Option<u64>,
 }
 
-fn parse_request(raw: &[u8]) -> Option<Request> {
-    let text = std::str::from_utf8(raw).ok()?;
+/// Why a request head could not be turned into a [`Request`].
+#[derive(Debug, PartialEq, Eq)]
+enum RequestError {
+    /// Structurally invalid: bad request line, non-UTF-8 bytes, bad or
+    /// contradictory `Content-Length`.
+    Malformed,
+    /// Valid HTTP we deliberately do not implement: a transfer coding we would
+    /// not decode, so the body cannot be framed.
+    UnsupportedTransferEncoding,
+}
+
+/// Read a complete request head — request line + header fields + terminating
+/// CRLFCRLF — from `reader`, in bounded increments.
+///
+/// One `read()` is not a message: TCP may split or coalesce arbitrarily, so a
+/// head is only parsed once its terminator has actually arrived. Bytes after
+/// the terminator (a request body) are never returned as headers, and the head
+/// may not grow past [`MAX_HEAD_BYTES`]; the over-limit case is reported
+/// distinctly so the caller can answer 431 instead of reading forever.
+#[derive(Debug, PartialEq, Eq)]
+enum HeadRead {
+    /// The head, truncated exactly through its CRLFCRLF terminator.
+    Complete(Vec<u8>),
+    /// No terminator arrived before the byte limit was reached.
+    TooLarge,
+    /// The reader timed out with an incomplete head.
+    TimedOut,
+    /// The peer closed (or the read failed) before the terminator. `buffered`
+    /// records whether any bytes of the head had arrived: half a head deserves a
+    /// 400, while an immediately-closed idle connection deserves silence.
+    Incomplete { buffered: bool },
+}
+
+fn find_head_terminator(buf: &[u8]) -> Option<usize> {
+    buf.windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4)
+}
+
+/// Read until the request head is terminated, the byte limit is hit, the peer
+/// closes, or a read error/timeout occurs. At most [`MAX_HEAD_BYTES`] bytes are
+/// ever buffered, so a client cannot grow this allocation without bound.
+fn read_request_head<R: Read>(reader: &mut R) -> HeadRead {
+    let mut head: Vec<u8> = Vec::with_capacity(1024);
+    let mut chunk = [0u8; READ_CHUNK];
+    loop {
+        // RFC 7230 §3.5: a server SHOULD ignore at least one empty line before
+        // the request-line. Leading CRLFs are dropped only while the head still
+        // starts with them, so no header or body byte is ever dropped.
+        while head.starts_with(b"\r\n") {
+            head.drain(..2);
+        }
+        if let Some(end) = find_head_terminator(&head) {
+            head.truncate(end);
+            return HeadRead::Complete(head);
+        }
+        if head.len() >= MAX_HEAD_BYTES {
+            return HeadRead::TooLarge;
+        }
+        let want = READ_CHUNK.min(MAX_HEAD_BYTES - head.len());
+        match reader.read(&mut chunk[..want]) {
+            Ok(0) => return HeadRead::Incomplete { buffered: !head.is_empty() },
+            Ok(n) => head.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
+                return HeadRead::TimedOut
+            }
+            Err(_) => return HeadRead::Incomplete { buffered: !head.is_empty() },
+        }
+    }
+}
+
+fn parse_request_checked(raw: &[u8]) -> Result<Request, RequestError> {
+    let text = std::str::from_utf8(raw).map_err(|_| RequestError::Malformed)?;
     let mut lines = text.split("\r\n");
-    let req_line = lines.next()?;
+    let req_line = lines.next().ok_or(RequestError::Malformed)?;
     let mut parts = req_line.split_whitespace();
-    let method = parts.next()?.to_string();
-    let raw_path = parts.next()?.to_string();
-    let _version = parts.next()?;
-    if _version != "HTTP/1.1" && _version != "HTTP/1.0" {
-        return None;
+    let method = parts.next().ok_or(RequestError::Malformed)?.to_string();
+    let raw_path = parts.next().ok_or(RequestError::Malformed)?.to_string();
+    let version = parts.next().ok_or(RequestError::Malformed)?;
+    if version != "HTTP/1.1" && version != "HTTP/1.0" {
+        return Err(RequestError::Malformed);
     }
     let mut if_mod = None;
+    let mut content_length: Option<u64> = None;
     for line in lines {
         if line.is_empty() {
             break;
         }
-        if let Some((k, v)) = line.split_once(':') {
-            if k.trim().eq_ignore_ascii_case("if-modified-since") {
-                if_mod = Some(v.trim().to_string());
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
+        let name = k.trim();
+        let value = v.trim();
+        if name.eq_ignore_ascii_case("if-modified-since") {
+            if_mod = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("content-length") {
+            // A Content-Length is an unsigned decimal byte count. A non-numeric
+            // value, an empty value, or two different values leave the message
+            // length ambiguous, so the request is malformed.
+            let parsed: u64 = value.parse().map_err(|_| RequestError::Malformed)?;
+            match content_length {
+                Some(previous) if previous != parsed => return Err(RequestError::Malformed),
+                _ => content_length = Some(parsed),
             }
+        } else if name.eq_ignore_ascii_case("transfer-encoding") && !value.eq_ignore_ascii_case("identity") {
+            // Body framing is never read, so an unsupported coding cannot be
+            // decoded. Refuse it instead of answering as though no body existed.
+            return Err(RequestError::UnsupportedTransferEncoding);
         }
     }
-    Some(Request { method, path: raw_path, if_modified_since: if_mod })
+    Ok(Request { method, path: raw_path, if_modified_since: if_mod, content_length })
+}
+
+#[cfg(test)]
+fn parse_request(raw: &[u8]) -> Option<Request> {
+    parse_request_checked(raw).ok()
+}
+
+/// Status to return for a head whose declared body framing is unacceptable, if
+/// any. The body itself is never read or buffered.
+fn framing_status(req: &Request) -> Option<(u16, &'static str, &'static [u8])> {
+    match req.content_length {
+        Some(len) if len > MAX_BODY_BYTES => Some((413, "Payload Too Large", b"413 payload too large\n")),
+        _ => None,
+    }
 }
 
 /// Serialize a complete response. Split out from the socket write so the framing
@@ -109,6 +239,11 @@ fn render(status: u16, reason: &str, headers: &[(String, String)], body: &[u8], 
 
 fn send(stream: &mut TcpStream, status: u16, reason: &str, headers: &[(String, String)], body: &[u8], head_only: bool) -> io::Result<()> {
     stream.write_all(&render(status, reason, headers, body, head_only))
+}
+
+/// The one header every plain-text error body is served with.
+fn text_plain_headers() -> Vec<(String, String)> {
+    vec![("Content-Type".to_string(), "text/plain".to_string())]
 }
 
 /// Map a request path onto a real file inside `root`, or the status to return.
@@ -141,18 +276,48 @@ fn resolve_target(root: &Path, raw_path: &str) -> Result<PathBuf, u16> {
 }
 
 fn handle(mut stream: TcpStream, root: &Path) {
-    let mut buf = vec![0u8; 16384];
-    let n = match stream.read(&mut buf) {
-        Ok(n) => n,
-        Err(_) => return,
+    // Bound how long an incomplete head may block, so a silent peer cannot pin
+    // a worker thread indefinitely. A timeout mid-head is answered as a 400.
+    let _ = stream.set_read_timeout(Some(HEAD_READ_TIMEOUT));
+    let head = match read_request_head(&mut stream) {
+        HeadRead::Complete(bytes) => bytes,
+        HeadRead::TooLarge => {
+            let _ = send(&mut stream, 431, "Request Header Fields Too Large", &text_plain_headers(), b"431 request header fields too large\n", false);
+            return;
+        }
+        HeadRead::TimedOut => {
+            // Half a head arrived and the peer stalled: answer 400 rather than
+            // silently dropping the connection.
+            let _ = send(&mut stream, 400, "Bad Request", &text_plain_headers(), b"400 bad request\n", false);
+            return;
+        }
+        // EOF before the terminator: half a head still deserves a 400 (the peer
+        // may be half-closing), while a connection that sent nothing at all is
+        // closed quietly.
+        HeadRead::Incomplete { buffered: true } => {
+            let _ = send(&mut stream, 400, "Bad Request", &text_plain_headers(), b"400 bad request\n", false);
+            return;
+        }
+        HeadRead::Incomplete { buffered: false } => return,
     };
-    let Some(req) = parse_request(&buf[..n]) else {
-        let _ = send(&mut stream, 400, "Bad Request", &[("Content-Type".into(), "text/plain".into())], b"400 bad request\n", false);
-        return;
+    let req = match parse_request_checked(&head) {
+        Ok(req) => req,
+        // An unsupported transfer coding cannot be framed, so it is refused the
+        // same way as any other unsatisfiable head.
+        Err(RequestError::UnsupportedTransferEncoding) | Err(RequestError::Malformed) => {
+            let _ = send(&mut stream, 400, "Bad Request", &text_plain_headers(), b"400 bad request\n", false);
+            return;
+        }
     };
     let head_only = req.method == "HEAD";
     if req.method != "GET" && req.method != "HEAD" {
         let _ = send(&mut stream, 405, "Method Not Allowed", &[("Allow".into(), "GET, HEAD".into()), ("Content-Type".into(), "text/plain".into())], b"405 method not allowed\n", head_only);
+        return;
+    }
+    // The body is never read, so the only thing to enforce is whether its
+    // declared framing is acceptable at all.
+    if let Some((status, reason, body)) = framing_status(&req) {
+        let _ = send(&mut stream, status, reason, &text_plain_headers(), body, head_only);
         return;
     }
     let file_path = match resolve_target(root, &req.path) {
