@@ -1,0 +1,9 @@
+{
+  "name": "barehttp",
+  "description": "Minimal HTTP server with strict, bounded request framing",
+  "stack": [
+    "cargo"
+  ],
+  "status": "active",
+  "primary_language": "Rust"
+}
