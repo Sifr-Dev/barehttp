@@ -1,9 +1,13 @@
 {
-  "name": "barehttp",
-  "description": "Minimal HTTP server with strict, bounded request framing",
+  "name": "Quasar",
+  "displayName": "Quasar",
+  "repo": "barehttp",
+  "description": "Zero-dependency static file HTTP/1.1 server with bounded request framing",
+  "summary": "Serves a directory over HTTP/1.1 with strict head limits, traversal-safe path resolution and conditional requests in a single crate-free binary.",
   "stack": [
     "cargo"
   ],
   "status": "active",
-  "primary_language": "Rust"
+  "primary_language": "Rust",
+  "license": "MIT"
 }
