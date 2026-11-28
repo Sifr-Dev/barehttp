@@ -16,19 +16,18 @@
 
 </div>
 
-> barehttp (formerly `barehttp`) serves one directory over HTTP/1.1 with bounded
+> barehttp serves one directory over HTTP/1.1 with bounded
 > request framing, traversal-safe path resolution and conditional requests.
 
 ## What it is
 
-barehttp is a static file server written against the Rust standard library only:
+This is a static file server written against the Rust standard library only:
 `std::net`, `std::fs`, `std::io`. Each connection gets a thread, the request head
 is read incrementally up to 16 KiB, and one response is written before the
 connection closes. It exists to be small enough to audit and strict enough to
 put in front of real files.
 
-The crate and the installed command keep their original names, `sifr-serve`;
-the product name is barehttp and the repository is still `Sifr-Dev/barehttp`.
+The crate and the installed command are both named `sifr-serve`.
 
 ## Current capabilities
 
@@ -171,7 +170,6 @@ concurrent load, which was not tested.
 - Directory listings and custom error pages.
 - TLS termination.
 - A `--help`/`--version` CLI surface.
-- Binary rename to `quasar` while keeping `sifr-serve` working.
 
 ## License
 
