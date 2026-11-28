@@ -1,6 +1,6 @@
 {
-  "name": "Quasar",
-  "displayName": "Quasar",
+  "name": "barehttp",
+  "displayName": "barehttp",
   "repo": "barehttp",
   "description": "Zero-dependency static file HTTP/1.1 server with bounded request framing",
   "summary": "Serves a directory over HTTP/1.1 with strict head limits, traversal-safe path resolution and conditional requests in a single crate-free binary.",

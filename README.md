@@ -1,8 +1,8 @@
 <div align="center">
 
-<img src="assets/banner.svg" alt="Quasar — static file HTTP/1.1 server" width="100%">
+<img src="assets/banner.svg" alt="barehttp — static file HTTP/1.1 server" width="100%">
 
-# Quasar
+# barehttp
 
 **Zero-dependency static file HTTP/1.1 server in Rust — no crates, no async runtime.**
 
@@ -16,19 +16,19 @@
 
 </div>
 
-> Quasar (formerly `barehttp`) serves one directory over HTTP/1.1 with bounded
+> barehttp (formerly `barehttp`) serves one directory over HTTP/1.1 with bounded
 > request framing, traversal-safe path resolution and conditional requests.
 
 ## What it is
 
-Quasar is a static file server written against the Rust standard library only:
+barehttp is a static file server written against the Rust standard library only:
 `std::net`, `std::fs`, `std::io`. Each connection gets a thread, the request head
 is read incrementally up to 16 KiB, and one response is written before the
 connection closes. It exists to be small enough to audit and strict enough to
 put in front of real files.
 
 The crate and the installed command keep their original names, `sifr-serve`;
-the product name is Quasar and the repository is still `Sifr-Dev/barehttp`.
+the product name is barehttp and the repository is still `Sifr-Dev/barehttp`.
 
 ## Current capabilities
 
